@@ -1,0 +1,206 @@
+name: Watch Next probe - diagnostics
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/watch-next-probe-fixed.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out your TizenTube Bridge fork
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Add permission and on-screen diagnostic test
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          manifest = Path('app/src/main/AndroidManifest.xml')
+          s = manifest.read_text(encoding='utf-8')
+          permission = '<uses-permission android:name="com.android.providers.tv.permission.WRITE_EPG_DATA" />'
+          if permission not in s:
+              if '<manifest' not in s:
+                  raise RuntimeError('Not an Android manifest')
+              end = s.index('>', s.index('<manifest'))
+              s = s[:end+1] + '\n    ' + permission + s[end+1:]
+
+          if 'experiment.continuetube.WatchNextProbeActivity' not in s:
+              activity = '''
+                  <activity
+                      android:name="experiment.continuetube.WatchNextProbeActivity"
+                      android:exported="true"
+                      android:label="Watch Next Probe">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              '''
+              if '</application>' not in s:
+                  raise RuntimeError('Could not find </application> in AndroidManifest.xml')
+              s = s.replace('</application>', activity + '\n    </application>', 1)
+          manifest.write_text(s, encoding='utf-8')
+          ET.parse(manifest)
+
+          source = Path('app/src/main/java/experiment/continuetube/WatchNextProbeActivity.java')
+          source.parent.mkdir(parents=True, exist_ok=True)
+          source.write_text(r'''package experiment.continuetube;
+
+          import android.app.Activity;
+          import android.content.ContentValues;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.database.Cursor;
+          import android.graphics.Color;
+          import android.media.tv.TvContract;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.util.Log;
+          import android.view.Gravity;
+          import android.view.ViewGroup;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+
+          public final class WatchNextProbeActivity extends Activity {
+              private static final String TAG = "ContinueTubeProbe";
+              private TextView output;
+              private Button publish;
+              private final StringBuilder messages = new StringBuilder();
+
+              @Override public void onCreate(Bundle state) {
+                  super.onCreate(state);
+                  LinearLayout screen = new LinearLayout(this);
+                  screen.setOrientation(LinearLayout.VERTICAL);
+                  screen.setPadding(28, 24, 28, 24);
+                  screen.setBackgroundColor(Color.rgb(23, 27, 35));
+                  TextView title = new TextView(this);
+                  title.setText("ContinueTube - Watch Next diagnostic");
+                  title.setTextSize(22);
+                  title.setTextColor(Color.WHITE);
+                  screen.addView(title);
+                  publish = new Button(this);
+                  publish.setText("PUBLISH TEST CARD AGAIN");
+                  screen.addView(publish);
+                  ScrollView scroll = new ScrollView(this);
+                  output = new TextView(this);
+                  output.setTextSize(18);
+                  output.setTextColor(Color.WHITE);
+                  output.setPadding(8, 18, 8, 18);
+                  scroll.addView(output);
+                  screen.addView(scroll, new LinearLayout.LayoutParams(
+                      ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
+                  setContentView(screen);
+                  publish.setOnClickListener(v -> runProbe());
+                  publish.requestFocus();
+                  runProbe();
+              }
+
+              private void status(String text) {
+                  Log.i(TAG, text);
+                  runOnUiThread(() -> {
+                      messages.append(text).append("\n\n");
+                      output.setText(messages.toString());
+                  });
+              }
+
+              private void runProbe() {
+                  publish.setEnabled(false);
+                  messages.setLength(0);
+                  output.setText("Starting...\n");
+                  new Thread(() -> {
+                      status("Android SDK: " + Build.VERSION.SDK_INT);
+                      if (Build.VERSION.SDK_INT < 26) {
+                          status("FAIL: Android 8.0+ required.");
+                          runOnUiThread(() -> publish.setEnabled(true));
+                          return;
+                      }
+                      String permission = "com.android.providers.tv.permission.WRITE_EPG_DATA";
+                      boolean granted = checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED;
+                      status("TV provider WRITE permission: " + (granted ? "GRANTED" : "DENIED"));
+                      try {
+                          final String videoId = "dQw4w9WgXc";
+                          Intent play = new Intent(Intent.ACTION_VIEW,
+                              Uri.parse("https://www.youtube.com/watch?v=" + videoId));
+                          play.setPackage("com.google.android.youtube.tv");
+                          ContentValues cv = new ContentValues();
+                          cv.put(TvContract.WatchNextPrograms.COLUMN_TITLE,
+                              "ContinueTube test: Never Gonna Give You Up");
+                          cv.put(TvContract.WatchNextPrograms.COLUMN_WATCH_NEXT_TYPE,
+                              TvContract.WatchNextPrograms.WATCH_NEXT_TYPE_CONTINUE);
+                          cv.put(TvContract.WatchNextPrograms.COLUMN_LAST_ENGAGEMENT_TIME_UTC_MILLIS,
+                              System.currentTimeMillis());
+                          cv.put("type", 4);
+                          cv.put("duration_millis", 213000);
+                          cv.put("last_playback_position_millis", 65000);
+                          cv.put("intent_uri", play.toUri(Intent.URI_INTENT_SCHEME));
+                          cv.put("internal_provider_id", "continuetube-probe-fixed-20261025");
+                          cv.put("poster_art_uri", "https://i.ytimg.com/vi/" + videoId + "/hqdefault.jpg");
+                          cv.put("thumbnail_uri", "https://i.ytimg.com/vi/" + videoId + "/hqdefault.jpg");
+                          Uri row = getContentResolver().insert(
+                              TvContract.WatchNextPrograms.CONTENT_URI, cv);
+                          if (row == null) {
+                              status("INSERT FAILED: ContentResolver returned null.");
+                          } else {
+                              status("INSERT SUCCEEDED: " + row);
+                          }
+                          try (Cursor cursor = getContentResolver().query(
+                              TvContract.WatchNextPrograms.CONTENT_URI,
+                              new String[] {"_id", "title"}, null, null, null)) {
+                              if (cursor == null) {
+                                  status("READ BACK: no cursor returned.");
+                              } else {
+                                  status("READ BACK: " + cursor.getCount() + " accessible Watch Next rows.");
+                                  while (cursor.moveToNext()) {
+                                      String title = cursor.getString(1);
+                                      if (title != null && title.startsWith("ContinueTube test:")) {
+                                          status("READ BACK TEST ITEM: " + cursor.getLong(0) + " " + title);
+                                      }
+                                  }
+                              }
+                          } catch (Exception queryError) {
+                              status("READ BACK ERROR: " + queryError.getClass().getSimpleName()
+                                  + " - " + queryError.getMessage());
+                          }
+                      } catch (Exception error) {
+                          status("INSERT FAILED: " + error.getClass().getSimpleName()
+                              + " - " + error.getMessage());
+                          Log.e(TAG, "Probe insertion error", error);
+                      }
+                      status("If INSERT SUCCEEDED but no Google TV card appears, the launcher may be filtering local entries. Screenshot this diagnostic screen.");
+                      runOnUiThread(() -> publish.setEnabled(true));
+                  }).start();
+              }
+          }
+          ''', encoding='utf-8')
+          print('Updated manifest and added persistent diagnostics activity')
+          PY
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon :app:assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: watch-next-probe-fixed-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 7
